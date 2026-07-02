@@ -36,6 +36,7 @@ func (q *Queue) queueKey(name string) string      { return fmt.Sprintf("goq:queu
 func (q *Queue) processingKey(name string) string { return fmt.Sprintf("goq:processing:%s", name) }
 func (q *Queue) dedupKey(jobID string) string     { return fmt.Sprintf("goq:dedup:%s", jobID) }
 func (q *Queue) jobKey(jobID string) string       { return fmt.Sprintf("goq:job:%s", jobID) }
+func (q *Queue) leaseKey(name string) string      { return fmt.Sprintf("goq:lease:%s", name) }
 
 // Enqueue adds a job to the named queue. Returns (false, nil) if the job ID
 // was already enqueued before (idempotency), without error — caller decides
@@ -75,14 +76,20 @@ func (q *Queue) Enqueue(ctx context.Context, queueName, payload string, priority
 }
 
 // Dequeue blocks up to timeout waiting for a job, atomically moving it from
-// the queue list to the processing list. Returns nil, nil on timeout (no job available).
-func (q *Queue) Dequeue(ctx context.Context, queueName string, timeout time.Duration) (*model.Job, error) {
+// the queue list to the processing list, and registers a lease that expires
+// after leaseDuration — if not Ack'd by then, the reaper will requeue it.
+func (q *Queue) Dequeue(ctx context.Context, queueName string, timeout, leaseDuration time.Duration) (*model.Job, error) {
 	jobID, err := q.client.BRPopLPush(ctx, q.queueKey(queueName), q.processingKey(queueName), timeout).Result()
 	if err == redis.Nil {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("brpoplpush: %w", err)
+	}
+
+	expiresAt := float64(time.Now().Add(leaseDuration).Unix())
+	if err := q.client.ZAdd(ctx, q.leaseKey(queueName), redis.Z{Score: expiresAt, Member: jobID}).Err(); err != nil {
+		return nil, fmt.Errorf("registering lease: %w", err)
 	}
 
 	job, err := q.getJob(ctx, jobID)
@@ -99,10 +106,13 @@ func (q *Queue) Dequeue(ctx context.Context, queueName string, timeout time.Dura
 	return job, nil
 }
 
-// Ack removes a completed job from the processing list.
+// Ack removes a completed job from the processing list and clears its lease.
 func (q *Queue) Ack(ctx context.Context, queueName, jobID string) error {
-	if err := q.client.LRem(ctx, q.processingKey(queueName), 1, jobID).Err(); err != nil {
-		return fmt.Errorf("ack lrem: %w", err)
+	pipe := q.client.TxPipeline()
+	pipe.LRem(ctx, q.processingKey(queueName), 1, jobID)
+	pipe.ZRem(ctx, q.leaseKey(queueName), jobID)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("ack: %w", err)
 	}
 	return nil
 }
@@ -129,4 +139,46 @@ func (q *Queue) saveJob(ctx context.Context, job *model.Job) error {
 
 func (q *Queue) Close() error {
 	return q.client.Close()
+}
+
+var requeueScript = redis.NewScript(`
+	local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+	if removed > 0 then
+		redis.call('LPUSH', KEYS[2], ARGV[1])
+	end
+	redis.call('ZREM', KEYS[3], ARGV[1])
+	return removed
+`)
+
+// RequeueStale scans for jobs whose lease has expired and atomically moves
+// them from processing back onto the main queue. Returns the number of jobs requeued.
+func (q *Queue) RequeueStale(ctx context.Context, queueName string) (int, error) {
+	now := float64(time.Now().Unix())
+	expired, err := q.client.ZRangeByScore(ctx, q.leaseKey(queueName), &redis.ZRangeBy{
+		Min: "-inf",
+		Max: fmt.Sprintf("%f", now),
+	}).Result()
+	if err != nil {
+		return 0, fmt.Errorf("scanning expired leases: %w", err)
+	}
+
+	requeued := 0
+	for _, jobID := range expired {
+		res, err := requeueScript.Run(ctx, q.client,
+			[]string{q.processingKey(queueName), q.queueKey(queueName), q.leaseKey(queueName)},
+			jobID,
+		).Result()
+		if err != nil {
+			return requeued, fmt.Errorf("requeue script for job %s: %w", jobID, err)
+		}
+		if n, ok := res.(int64); ok && n > 0 {
+			requeued++
+			if job, err := q.getJob(ctx, jobID); err == nil {
+				job.Status = model.StatusPending
+				job.UpdatedAt = time.Now().UTC()
+				_ = q.saveJob(ctx, job) // best-effort metadata update, not critical path
+			}
+		}
+	}
+	return requeued, nil
 }

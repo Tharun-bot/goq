@@ -14,11 +14,12 @@ import (
 type Handler func(ctx context.Context, job *model.Job) error
 
 type Pool struct {
-	q           *queue.Queue
-	queueName   string
-	concurrency int
-	handler     Handler
-	pollTimeout time.Duration
+	q             *queue.Queue
+	queueName     string
+	concurrency   int
+	handler       Handler
+	pollTimeout   time.Duration
+	leaseDuration time.Duration
 
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
@@ -26,11 +27,12 @@ type Pool struct {
 
 func NewPool(q *queue.Queue, queueName string, concurrency int, handler Handler) *Pool {
 	return &Pool{
-		q:           q,
-		queueName:   queueName,
-		concurrency: concurrency,
-		handler:     handler,
-		pollTimeout: 2 * time.Second,
+		q:             q,
+		queueName:     queueName,
+		concurrency:   concurrency,
+		handler:       handler,
+		pollTimeout:   2 * time.Second,
+		leaseDuration: 30 * time.Second,
 	}
 }
 
@@ -57,7 +59,7 @@ func (p *Pool) runWorker(ctx context.Context, id int) {
 		default:
 		}
 
-		job, err := p.q.Dequeue(ctx, p.queueName, p.pollTimeout)
+		job, err := p.q.Dequeue(ctx, p.queueName, p.pollTimeout, p.leaseDuration)
 		if err != nil {
 			log.Printf("worker %d: dequeue error: %v", id, err)
 			continue
