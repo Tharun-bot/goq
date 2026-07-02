@@ -1,5 +1,13 @@
-module github.com/Tharun-bot/goq/internal/config
+module github.com/Tharun-bot/goq
 
-go 1.22.5
+go 1.24
 
-require github.com/Tharun-bot/goq v0.0.0-20260702132125-81f4d2efc59d
+require (
+	github.com/google/uuid v1.6.0
+	github.com/redis/go-redis/v9 v9.21.0
+)
+
+require (
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
+)
