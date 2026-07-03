@@ -28,7 +28,7 @@ func TestEnqueueDequeue(t *testing.T) {
 		t.Fatal("expected job to be newly created")
 	}
 
-	got, err := q.Dequeue(ctx, "test-queue", 2*time.Second)
+	got, err := q.Dequeue(ctx, "test-queue", 2*time.Second, 30*time.Second)
 	if err != nil {
 		t.Fatalf("dequeue: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestDequeueTimeout(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	job, err := q.Dequeue(ctx, "empty-queue-"+time.Now().String(), 1*time.Second)
+	job, err := q.Dequeue(ctx, "empty-queue-"+time.Now().String(), 1*time.Second, 30*time.Second)
 	if err != nil {
 		t.Fatalf("dequeue: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestAckRemovesFromProcessing(t *testing.T) {
 		t.Fatalf("enqueue: %v", err)
 	}
 
-	got, err := q.Dequeue(ctx, "ack-queue", 2*time.Second)
+	got, err := q.Dequeue(ctx, "ack-queue", 2*time.Second, 30*time.Second)
 	if err != nil || got == nil {
 		t.Fatalf("dequeue failed: %v", err)
 	}

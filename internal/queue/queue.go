@@ -37,6 +37,9 @@ func (q *Queue) processingKey(name string) string { return fmt.Sprintf("goq:proc
 func (q *Queue) dedupKey(jobID string) string     { return fmt.Sprintf("goq:dedup:%s", jobID) }
 func (q *Queue) jobKey(jobID string) string       { return fmt.Sprintf("goq:job:%s", jobID) }
 func (q *Queue) leaseKey(name string) string      { return fmt.Sprintf("goq:lease:%s", name) }
+func (q *Queue) retryKey(name string) string      { return fmt.Sprintf("goq:retry:%s", name) }
+func (q *Queue) dlqKey(name string) string        { return fmt.Sprintf("goq:dlq:%s", name) }
+func (q *Queue) scheduledKey(name string) string  { return fmt.Sprintf("goq:scheduled:%s", name) }
 
 // Enqueue adds a job to the named queue. Returns (false, nil) if the job ID
 // was already enqueued before (idempotency), without error — caller decides
@@ -181,4 +184,159 @@ func (q *Queue) RequeueStale(ctx context.Context, queueName string) (int, error)
 		}
 	}
 	return requeued, nil
+}
+
+// Fail records a job failure. It clears the job from processing/lease, and
+// either schedules a backoff retry or moves the job to the DLQ if maxRetries
+// has been exhausted.
+func (q *Queue) Fail(ctx context.Context, queueName, jobID string, maxRetries int) error {
+	job, err := q.getJob(ctx, jobID)
+	if err != nil {
+		return fmt.Errorf("fail: loading job: %w", err)
+	}
+
+	pipe := q.client.TxPipeline()
+	pipe.LRem(ctx, q.processingKey(queueName), 1, jobID)
+	pipe.ZRem(ctx, q.leaseKey(queueName), jobID)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("fail: clearing processing/lease: %w", err)
+	}
+
+	job.RetryCount++
+	job.UpdatedAt = time.Now().UTC()
+
+	if job.RetryCount > maxRetries {
+		job.Status = model.StatusDead
+		if err := q.saveJob(ctx, job); err != nil {
+			return fmt.Errorf("fail: saving dead job: %w", err)
+		}
+		if err := q.client.LPush(ctx, q.dlqKey(queueName), jobID).Err(); err != nil {
+			return fmt.Errorf("fail: pushing to dlq: %w", err)
+		}
+		return nil
+	}
+
+	job.Status = model.StatusFailed
+	if err := q.saveJob(ctx, job); err != nil {
+		return fmt.Errorf("fail: saving failed job: %w", err)
+	}
+
+	backoff := time.Duration(1<<uint(job.RetryCount)) * time.Second // retry 1->2s, 2->4s, 3->8s
+	nextAttempt := float64(time.Now().Add(backoff).Unix())
+	if err := q.client.ZAdd(ctx, q.retryKey(queueName), redis.Z{Score: nextAttempt, Member: jobID}).Err(); err != nil {
+		return fmt.Errorf("fail: scheduling retry: %w", err)
+	}
+
+	return nil
+}
+
+// PromoteDueRetries moves jobs whose backoff window has elapsed from the
+// retry set back onto the main queue. Returns the number promoted.
+func (q *Queue) PromoteDueRetries(ctx context.Context, queueName string) (int, error) {
+	now := float64(time.Now().Unix())
+	due, err := q.client.ZRangeByScore(ctx, q.retryKey(queueName), &redis.ZRangeBy{
+		Min: "-inf",
+		Max: fmt.Sprintf("%f", now),
+	}).Result()
+	if err != nil {
+		return 0, fmt.Errorf("scanning due retries: %w", err)
+	}
+
+	promoted := 0
+	for _, jobID := range due {
+		res, err := promoteScript.Run(ctx, q.client,
+			[]string{q.retryKey(queueName), q.queueKey(queueName)},
+			jobID,
+		).Result()
+		if err != nil {
+			return promoted, fmt.Errorf("promote script for job %s: %w", jobID, err)
+		}
+		if n, ok := res.(int64); ok && n > 0 {
+			promoted++
+			if job, err := q.getJob(ctx, jobID); err == nil {
+				job.Status = model.StatusPending
+				job.UpdatedAt = time.Now().UTC()
+				_ = q.saveJob(ctx, job)
+			}
+		}
+	}
+	return promoted, nil
+}
+
+var promoteScript = redis.NewScript(`
+	local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+	if removed > 0 then
+		redis.call('LPUSH', KEYS[2], ARGV[1])
+	end
+	return removed
+`)
+
+// DLQLen returns the current size of a queue's dead letter list.
+func (q *Queue) DLQLen(ctx context.Context, queueName string) (int64, error) {
+	return q.client.LLen(ctx, q.dlqKey(queueName)).Result()
+}
+
+// EnqueueDelayed schedules a job to become available on the main queue at
+// runAt. Uses the same idempotency dedup as Enqueue.
+func (q *Queue) EnqueueDelayed(ctx context.Context, queueName, payload string, priority int, runAt time.Time) (*model.Job, bool, error) {
+	job := &model.Job{
+		ID:        uuid.NewString(),
+		Queue:     queueName,
+		Payload:   payload,
+		Priority:  priority,
+		Status:    model.StatusPending,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	ok, err := q.client.SetNX(ctx, q.dedupKey(job.ID), 1, 24*time.Hour).Result()
+	if err != nil {
+		return nil, false, fmt.Errorf("dedup check: %w", err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+
+	data, err := json.Marshal(job)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal job: %w", err)
+	}
+
+	pipe := q.client.TxPipeline()
+	pipe.Set(ctx, q.jobKey(job.ID), data, 0)
+	pipe.ZAdd(ctx, q.scheduledKey(queueName), redis.Z{Score: float64(runAt.Unix()), Member: job.ID})
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, false, fmt.Errorf("enqueue delayed pipeline: %w", err)
+	}
+
+	return job, true, nil
+}
+
+// PromoteDueScheduled moves scheduled jobs whose runAt has passed onto the
+// main queue. Returns the number promoted. Reuses the same atomic
+// remove-then-push script as retry promotion.
+func (q *Queue) PromoteDueScheduled(ctx context.Context, queueName string) (int, error) {
+	now := float64(time.Now().Unix())
+	due, err := q.client.ZRangeByScore(ctx, q.scheduledKey(queueName), &redis.ZRangeBy{
+		Min: "-inf",
+		Max: fmt.Sprintf("%f", now),
+	}).Result()
+	if err != nil {
+		return 0, fmt.Errorf("scanning due scheduled jobs: %w", err)
+	}
+
+	promoted := 0
+	for _, jobID := range due {
+		res, err := promoteScript.Run(ctx, q.client,
+			[]string{q.scheduledKey(queueName), q.queueKey(queueName)},
+			jobID,
+		).Result()
+		if err != nil {
+			return promoted, fmt.Errorf("promote script for job %s: %w", jobID, err)
+		}
+		if n, ok := res.(int64); ok && n > 0 {
+			promoted++
+		}
+	}
+	return promoted, nil
 }
