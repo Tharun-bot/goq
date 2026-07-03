@@ -20,6 +20,7 @@ type Pool struct {
 	handler       Handler
 	pollTimeout   time.Duration
 	leaseDuration time.Duration
+	maxRetries    int
 
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
@@ -33,6 +34,7 @@ func NewPool(q *queue.Queue, queueName string, concurrency int, handler Handler)
 		handler:       handler,
 		pollTimeout:   2 * time.Second,
 		leaseDuration: 30 * time.Second,
+		maxRetries:    3,
 	}
 }
 
@@ -74,14 +76,24 @@ func (p *Pool) runWorker(ctx context.Context, id int) {
 
 func (p *Pool) process(ctx context.Context, workerID int, job *model.Job) {
 	err := p.handler(ctx, job)
+
+	// Use a fresh context for the Ack/Fail write — the job's outcome must be
+	// recorded even if the pool's shutdown context has already been cancelled.
+	// Using the cancellable ctx here caused a real bug: a job finishing right as
+	// Stop() fires would complete successfully but fail to Ack, making the
+	// reaper wrongly reprocess an already-completed job 30s later.
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	if err != nil {
 		log.Printf("worker %d: job %s failed: %v", workerID, job.ID, err)
-		// Phase 4 will add retry/DLQ logic here. For now, just log and leave
-		// it in the processing list — Phase 3's reaper will pick it up.
+		if failErr := p.q.Fail(cleanupCtx, p.queueName, job.ID, p.maxRetries); failErr != nil {
+			log.Printf("worker %d: failed to record failure for job %s: %v", workerID, job.ID, failErr)
+		}
 		return
 	}
 
-	if ackErr := p.q.Ack(ctx, p.queueName, job.ID); ackErr != nil {
+	if ackErr := p.q.Ack(cleanupCtx, p.queueName, job.ID); ackErr != nil {
 		log.Printf("worker %d: ack failed for job %s: %v", workerID, job.ID, ackErr)
 		return
 	}
