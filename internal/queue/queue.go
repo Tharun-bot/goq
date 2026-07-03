@@ -44,38 +44,42 @@ func (q *Queue) scheduledKey(name string) string  { return fmt.Sprintf("goq:sche
 // Enqueue adds a job to the named queue. Returns (false, nil) if the job ID
 // was already enqueued before (idempotency), without error — caller decides
 // whether that's worth logging.
+// func (q *Queue) Enqueue(ctx context.Context, queueName, payload string, priority int) (*model.Job, bool, error) {
+// 	job := &model.Job{
+// 		ID:        uuid.NewString(),
+// 		Queue:     queueName,
+// 		Payload:   payload,
+// 		Priority:  priority,
+// 		Status:    model.StatusPending,
+// 		CreatedAt: time.Now().UTC(),
+// 		UpdatedAt: time.Now().UTC(),
+// 	}
+
+// 	ok, err := q.client.SetNX(ctx, q.dedupKey(job.ID), 1, 24*time.Hour).Result()
+// 	if err != nil {
+// 		return nil, false, fmt.Errorf("dedup check: %w", err)
+// 	}
+// 	if !ok {
+// 		return nil, false, nil
+// 	}
+
+// 	data, err := json.Marshal(job)
+// 	if err != nil {
+// 		return nil, false, fmt.Errorf("marshal job: %w", err)
+// 	}
+
+// 	pipe := q.client.TxPipeline()
+// 	pipe.Set(ctx, q.jobKey(job.ID), data, 0)
+// 	pipe.LPush(ctx, q.queueKey(queueName), job.ID)
+// 	if _, err := pipe.Exec(ctx); err != nil {
+// 		return nil, false, fmt.Errorf("enqueue pipeline: %w", err)
+// 	}
+
+// 	return job, true, nil
+// }
+
 func (q *Queue) Enqueue(ctx context.Context, queueName, payload string, priority int) (*model.Job, bool, error) {
-	job := &model.Job{
-		ID:        uuid.NewString(),
-		Queue:     queueName,
-		Payload:   payload,
-		Priority:  priority,
-		Status:    model.StatusPending,
-		CreatedAt: time.Now().UTC(),
-		UpdatedAt: time.Now().UTC(),
-	}
-
-	ok, err := q.client.SetNX(ctx, q.dedupKey(job.ID), 1, 24*time.Hour).Result()
-	if err != nil {
-		return nil, false, fmt.Errorf("dedup check: %w", err)
-	}
-	if !ok {
-		return nil, false, nil
-	}
-
-	data, err := json.Marshal(job)
-	if err != nil {
-		return nil, false, fmt.Errorf("marshal job: %w", err)
-	}
-
-	pipe := q.client.TxPipeline()
-	pipe.Set(ctx, q.jobKey(job.ID), data, 0)
-	pipe.LPush(ctx, q.queueKey(queueName), job.ID)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return nil, false, fmt.Errorf("enqueue pipeline: %w", err)
-	}
-
-	return job, true, nil
+	return q.EnqueueWithID(ctx, uuid.NewString(), queueName, payload, priority)
 }
 
 // Dequeue blocks up to timeout waiting for a job, atomically moving it from
@@ -339,4 +343,110 @@ func (q *Queue) PromoteDueScheduled(ctx context.Context, queueName string) (int,
 		}
 	}
 	return promoted, nil
+}
+
+// EnqueueWithID is like Enqueue but lets the caller supply the job ID instead
+// of generating one. Used by the API layer so an idempotency key can be
+// pre-associated with a specific job ID before the job is created.
+func (q *Queue) EnqueueWithID(ctx context.Context, id, queueName, payload string, priority int) (*model.Job, bool, error) {
+	job := &model.Job{
+		ID:        id,
+		Queue:     queueName,
+		Payload:   payload,
+		Priority:  priority,
+		Status:    model.StatusPending,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	ok, err := q.client.SetNX(ctx, q.dedupKey(job.ID), 1, 24*time.Hour).Result()
+	if err != nil {
+		return nil, false, fmt.Errorf("dedup check: %w", err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+
+	data, err := json.Marshal(job)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal job: %w", err)
+	}
+
+	pipe := q.client.TxPipeline()
+	pipe.Set(ctx, q.jobKey(job.ID), data, 0)
+	pipe.LPush(ctx, q.queueKey(queueName), job.ID)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, false, fmt.Errorf("enqueue pipeline: %w", err)
+	}
+
+	return job, true, nil
+}
+
+func (q *Queue) apiIdemKey(key string) string { return fmt.Sprintf("goq:api-idem:%s", key) }
+
+// ClaimIdempotencyKey attempts to atomically associate key with jobID.
+// claimed=true means this call won the race and the caller should proceed to
+// create the job. claimed=false means someone already claimed this key —
+// existingJobID tells the caller which job to return instead.
+func (q *Queue) ClaimIdempotencyKey(ctx context.Context, key, jobID string) (existingJobID string, claimed bool, err error) {
+	ok, err := q.client.SetNX(ctx, q.apiIdemKey(key), jobID, 24*time.Hour).Result()
+	if err != nil {
+		return "", false, fmt.Errorf("claim idempotency key: %w", err)
+	}
+	if ok {
+		return jobID, true, nil
+	}
+	existing, err := q.client.Get(ctx, q.apiIdemKey(key)).Result()
+	if err != nil {
+		return "", false, fmt.Errorf("fetch existing idempotency mapping: %w", err)
+	}
+	return existing, false, nil
+}
+
+// GetJob retrieves a job by ID. Returns nil, nil (not an error) if not found —
+// callers translate that into a 404 rather than a 500.
+func (q *Queue) GetJob(ctx context.Context, jobID string) (*model.Job, error) {
+	data, err := q.client.Get(ctx, q.jobKey(jobID)).Result()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get job %s: %w", jobID, err)
+	}
+	var job model.Job
+	if err := json.Unmarshal([]byte(data), &job); err != nil {
+		return nil, fmt.Errorf("unmarshal job: %w", err)
+	}
+	return &job, nil
+}
+
+type QueueStats struct {
+	Queue      string `json:"queue"`
+	Pending    int64  `json:"pending"`
+	Processing int64  `json:"processing"`
+	Scheduled  int64  `json:"scheduled"`
+	Retrying   int64  `json:"retrying"`
+	DeadLetter int64  `json:"dead_letter"`
+}
+
+// Stats returns a snapshot of a queue's current state across all its
+// internal Redis structures in a single round trip.
+func (q *Queue) Stats(ctx context.Context, queueName string) (*QueueStats, error) {
+	pipe := q.client.TxPipeline()
+	pendingCmd := pipe.LLen(ctx, q.queueKey(queueName))
+	processingCmd := pipe.LLen(ctx, q.processingKey(queueName))
+	scheduledCmd := pipe.ZCard(ctx, q.scheduledKey(queueName))
+	retryingCmd := pipe.ZCard(ctx, q.retryKey(queueName))
+	dlqCmd := pipe.LLen(ctx, q.dlqKey(queueName))
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("stats pipeline: %w", err)
+	}
+	return &QueueStats{
+		Queue:      queueName,
+		Pending:    pendingCmd.Val(),
+		Processing: processingCmd.Val(),
+		Scheduled:  scheduledCmd.Val(),
+		Retrying:   retryingCmd.Val(),
+		DeadLetter: dlqCmd.Val(),
+	}, nil
 }
