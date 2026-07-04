@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/Tharun-bot/goq/internal/queue"
 )
@@ -25,6 +26,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /jobs", s.handleCreateJob)
 	s.mux.HandleFunc("GET /jobs/{id}", s.handleGetJob)
 	s.mux.HandleFunc("GET /queues/{name}/stats", s.handleQueueStats)
+	s.mux.Handle("GET /metrics", promhttp.Handler())
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

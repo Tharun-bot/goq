@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Tharun-bot/goq/internal/metrics"
 	"github.com/Tharun-bot/goq/internal/model"
 	"github.com/Tharun-bot/goq/internal/queue"
 	"github.com/Tharun-bot/goq/internal/store"
@@ -22,10 +23,18 @@ type Pool struct {
 	pollTimeout   time.Duration
 	leaseDuration time.Duration
 	maxRetries    int
-	auditWriter   *store.AuditWriter // nil is fine — audit is optional
+	auditWriter   *store.AuditWriter
+	metrics       *metrics.Metrics // nil is fine — metrics are optional, same pattern as auditWriter
 
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
+}
+
+// WithMetrics attaches a metrics recorder. Optional — omit for tests that
+// don't need a Prometheus registry.
+func (p *Pool) WithMetrics(m *metrics.Metrics) *Pool {
+	p.metrics = m
+	return p
 }
 
 func NewPool(q *queue.Queue, queueName string, concurrency int, handler Handler) *Pool {
@@ -85,7 +94,14 @@ func (p *Pool) runWorker(ctx context.Context, id int) {
 }
 
 func (p *Pool) process(ctx context.Context, workerID int, job *model.Job) {
+	if p.metrics != nil {
+		p.metrics.ActiveWorkers.Inc()
+		defer p.metrics.ActiveWorkers.Dec()
+	}
+
+	start := time.Now()
 	err := p.handler(ctx, job)
+	duration := time.Since(start)
 
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -98,6 +114,13 @@ func (p *Pool) process(ctx context.Context, workerID int, job *model.Job) {
 		if p.auditWriter != nil {
 			p.auditWriter.Record(store.AuditEvent{Job: job, ErrorMessage: err.Error()})
 		}
+		if p.metrics != nil {
+			status := "failed"
+			if job.RetryCount+1 > p.maxRetries {
+				status = "dead_letter"
+			}
+			p.metrics.RecordCompletion(p.queueName, status, duration)
+		}
 		return
 	}
 
@@ -108,6 +131,9 @@ func (p *Pool) process(ctx context.Context, workerID int, job *model.Job) {
 	log.Printf("worker %d: job %s completed", workerID, job.ID)
 	if p.auditWriter != nil {
 		p.auditWriter.Record(store.AuditEvent{Job: job})
+	}
+	if p.metrics != nil {
+		p.metrics.RecordCompletion(p.queueName, "completed", duration)
 	}
 }
 
