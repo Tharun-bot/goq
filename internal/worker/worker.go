@@ -8,6 +8,7 @@ import (
 
 	"github.com/Tharun-bot/goq/internal/model"
 	"github.com/Tharun-bot/goq/internal/queue"
+	"github.com/Tharun-bot/goq/internal/store"
 )
 
 // Handler processes a single job's payload. Returning an error means the job failed.
@@ -21,6 +22,7 @@ type Pool struct {
 	pollTimeout   time.Duration
 	leaseDuration time.Duration
 	maxRetries    int
+	auditWriter   *store.AuditWriter // nil is fine — audit is optional
 
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
@@ -36,6 +38,14 @@ func NewPool(q *queue.Queue, queueName string, concurrency int, handler Handler)
 		leaseDuration: 30 * time.Second,
 		maxRetries:    3,
 	}
+}
+
+// WithAuditWriter attaches an audit writer so job completions/failures get
+// recorded to Postgres asynchronously. Optional — omit for tests that don't
+// need Postgres running.
+func (p *Pool) WithAuditWriter(w *store.AuditWriter) *Pool {
+	p.auditWriter = w
+	return p
 }
 
 // Start launches `concurrency` goroutines, each looping: dequeue -> handle -> ack.
@@ -77,11 +87,6 @@ func (p *Pool) runWorker(ctx context.Context, id int) {
 func (p *Pool) process(ctx context.Context, workerID int, job *model.Job) {
 	err := p.handler(ctx, job)
 
-	// Use a fresh context for the Ack/Fail write — the job's outcome must be
-	// recorded even if the pool's shutdown context has already been cancelled.
-	// Using the cancellable ctx here caused a real bug: a job finishing right as
-	// Stop() fires would complete successfully but fail to Ack, making the
-	// reaper wrongly reprocess an already-completed job 30s later.
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -89,6 +94,9 @@ func (p *Pool) process(ctx context.Context, workerID int, job *model.Job) {
 		log.Printf("worker %d: job %s failed: %v", workerID, job.ID, err)
 		if failErr := p.q.Fail(cleanupCtx, p.queueName, job.ID, p.maxRetries); failErr != nil {
 			log.Printf("worker %d: failed to record failure for job %s: %v", workerID, job.ID, failErr)
+		}
+		if p.auditWriter != nil {
+			p.auditWriter.Record(store.AuditEvent{Job: job, ErrorMessage: err.Error()})
 		}
 		return
 	}
@@ -98,6 +106,9 @@ func (p *Pool) process(ctx context.Context, workerID int, job *model.Job) {
 		return
 	}
 	log.Printf("worker %d: job %s completed", workerID, job.ID)
+	if p.auditWriter != nil {
+		p.auditWriter.Record(store.AuditEvent{Job: job})
+	}
 }
 
 // Stop cancels all workers and blocks until they finish their current job.
