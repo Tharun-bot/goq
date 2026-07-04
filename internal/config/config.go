@@ -12,7 +12,7 @@ func Load() Config {
 	return Config{
 		RedisURL:    getEnv("REDIS_URL", "redis://localhost:6379"),
 		DatabaseURL: getEnv("DATABASE_URL", "postgres://goq:goq@localhost:5432/goq?sslmode=disable"),
-		APIPort:     getEnv("API_PORT", "8080"),
+		APIPort:     getEnv("API_PORT", "8081"),
 	}
 }
 

@@ -2,8 +2,7 @@ version: "3.8"
 services:
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    ports: ["6379:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -16,10 +15,34 @@ services:
       POSTGRES_USER: goq
       POSTGRES_PASSWORD: goq
       POSTGRES_DB: goq
-    ports:
-      - "5432:5432"
+    ports: ["5432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U goq"]
       interval: 2s
       timeout: 3s
       retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports: ["8081:8080"]
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://goq:goq@postgres:5432/goq?sslmode=disable
+      API_PORT: 8080
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://goq:goq@postgres:5432/goq?sslmode=disable
+    command: ["-queue=default", "-concurrency=10"]
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }

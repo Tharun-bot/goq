@@ -1,0 +1,3 @@
+POST http://localhost:8081/jobs
+Content-Type: application/json
+@bench_body.json
