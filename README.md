@@ -24,43 +24,7 @@ The project was built from scratch to demonstrate backend infrastructure enginee
 ---
 
 ## Architecture
-
-```text
-                    HTTP API
-              POST /jobs
-              GET  /jobs/:id
-                     │
-                     ▼
-             ┌────────────────┐
-             │      Redis      │
-             │-----------------│
-             │ Queue           │
-             │ Processing      │
-             │ Lease ZSET      │
-             │ Retry ZSET      │
-             │ Schedule ZSET   │
-             └────────────────┘
-                     ▲
-                     │
-          BRPOPLPUSH │
-                     │
-             ┌────────────────┐
-             │   Worker Pool   │
-             └────────────────┘
-               ▲     ▲      ▲
-               │     │      │
-          Reaper Retry Scheduler
-
-                     │
-                     ▼
-
-             PostgreSQL (Audit)
-
-                     │
-                     ▼
-
-              Prometheus Metrics
-```
+![alt text](image-2.png)
 
 Redis contains every hot-path data structure required for queue processing.
 
